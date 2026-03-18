@@ -292,17 +292,16 @@ def solve_harmonic_extension(
 
     return field
 
-
-def smoothstep01(x: np.ndarray) -> np.ndarray:
-    x = np.clip(x, 0.0, 1.0)
-    return x * x * (3.0 - 2.0 * x)
-
-
 def edge_falloff(distance: np.ndarray, fade: float) -> np.ndarray:
     if fade <= 1e-6:
         return np.zeros_like(distance, dtype=np.float32)
     t = np.clip(distance / fade, 0.0, 1.0)
     return 1.0 - smoothstep01(t)
+
+
+def smoothstep01(x: np.ndarray) -> np.ndarray:
+    x = np.clip(x, 0.0, 1.0)
+    return x * x * (3.0 - 2.0 * x)
 
 
 def synthesize_back_face(
@@ -311,32 +310,45 @@ def synthesize_back_face(
     right: np.ndarray,
     top: np.ndarray,
     bottom: np.ndarray,
-    strip_ratio: float = 0.18,
-    fade_multiplier: float = 2.4,
-    guide_blur_radius: float = 0.8
+    lock_ratio: float = 0.008,
+    source_ratio: float = 0.30,
+    feather_ratio: float = 0.22,
+    source_blur_radius: float = 0.8,
+    guide_blur_radius: float = 0.18,
+    guide_mix_center: float = 0.92,
+    guide_mix_edge: float = 0.18,
+    seam_blur_radius: float = 0.55
 ) -> np.ndarray:
     size = front.shape[0]
-    strip = max(8, int(size * strip_ratio))
-    fade = max(float(strip) * fade_multiplier, 8.0)
 
-    # Interior guide
-    # Rotate FRONT by 180 so the back gets real cloud structure
-    guide = np.rot90(front, 2).copy()
+    lock = max(2, int(size * lock_ratio))
+    source_w = max(lock + 16, int(size * source_ratio))
+    feather = max(lock + 12, int(size * feather_ratio))
+
+    rotated_front = np.rot90(front, 2).copy()
+    neighbor_avg = (left + right + top + bottom) * 0.25
+    guide = rotated_front * guide_mix_center + neighbor_avg * (1.0 - guide_mix_center)
 
     if guide_blur_radius > 0.0:
         guide = blur_image(guide, guide_blur_radius)
 
-    # Correct neighbor strips for BACK
-    left_strip = right[:, -strip:, :].copy()
-    right_strip = left[:, :strip, :].copy()
-    top_strip = top[-strip:, :, :].copy()
-    bottom_strip = bottom[:strip, :, :].copy()
+    # Wide crops, not thin strips
+    left_src = right[:, -source_w:, :].copy()
+    right_src = left[:, :source_w, :].copy()
+    top_src = top[-source_w:, :, :].copy()
+    bottom_src = bottom[:source_w, :, :].copy()
 
-    # Stretch strips to full back size
-    left_full = resize_image(left_strip, size, size)
-    right_full = resize_image(right_strip, size, size)
-    top_full = resize_image(top_strip, size, size)
-    bottom_full = resize_image(bottom_strip, size, size)
+    if source_blur_radius > 0.0:
+        left_src = blur_image(left_src, source_blur_radius)
+        right_src = blur_image(right_src, source_blur_radius)
+        top_src = blur_image(top_src, source_blur_radius)
+        bottom_src = blur_image(bottom_src, source_blur_radius)
+
+    # Compress wide crops into seam bands
+    left_band = resize_image(left_src, feather, size)
+    right_band = resize_image(right_src, feather, size)
+    top_band = resize_image(top_src, size, feather)
+    bottom_band = resize_image(bottom_src, size, feather)
 
     yy, xx = np.mgrid[0:size, 0:size].astype(np.float32)
 
@@ -345,39 +357,49 @@ def synthesize_back_face(
     d_top = yy
     d_bottom = (size - 1) - yy
 
-    w_left = edge_falloff(d_left, fade)
-    w_right = edge_falloff(d_right, fade)
-    w_top = edge_falloff(d_top, fade)
-    w_bottom = edge_falloff(d_bottom, fade)
+    w_left = 1.0 - smoothstep01(d_left / feather)
+    w_right = 1.0 - smoothstep01(d_right / feather)
+    w_top = 1.0 - smoothstep01(d_top / feather)
+    w_bottom = 1.0 - smoothstep01(d_bottom / feather)
 
-    # Weighted blend
-    guide_weight = np.ones((size, size), dtype=np.float32)
+    edge_strength = np.maximum.reduce([w_left, w_right, w_top, w_bottom])
+    guide_weight = guide_mix_edge + (guide_mix_center - guide_mix_edge) * (1.0 - edge_strength)
+    guide_weight = np.clip(guide_weight, 0.0, 1.0)
 
     acc = guide * guide_weight[..., None]
     wsum = guide_weight.copy()
 
-    acc += left_full * w_left[..., None]
+    left_canvas = np.zeros_like(guide)
+    right_canvas = np.zeros_like(guide)
+    top_canvas = np.zeros_like(guide)
+    bottom_canvas = np.zeros_like(guide)
+
+    left_canvas[:, :feather, :] = left_band
+    right_canvas[:, -feather:, :] = right_band
+    top_canvas[:feather, :, :] = top_band
+    bottom_canvas[-feather:, :, :] = bottom_band
+
+    acc += left_canvas * w_left[..., None]
     wsum += w_left
 
-    acc += right_full * w_right[..., None]
+    acc += right_canvas * w_right[..., None]
     wsum += w_right
 
-    acc += top_full * w_top[..., None]
+    acc += top_canvas * w_top[..., None]
     wsum += w_top
 
-    acc += bottom_full * w_bottom[..., None]
+    acc += bottom_canvas * w_bottom[..., None]
     wsum += w_bottom
 
     back = acc / np.maximum(wsum[..., None], 1e-6)
 
-    # Lock exact seam pixels
-    back[:, 0, :] = right[:, -1, :]
-    back[:, -1, :] = left[:, 0, :]
-    back[0, :, :] = top[-1, :, :]
-    back[-1, :, :] = bottom[0, :, :]
+    if seam_blur_radius > 0.0:
+        blurred = blur_image(back, seam_blur_radius)
+        seam_mask = np.maximum.reduce([w_left, w_right, w_top, w_bottom])
+        seam_mask = smoothstep01(seam_mask)[..., None]
+        back = back * (1.0 - seam_mask) + blurred * seam_mask
 
-    # Also lock a thin border band so the preview looks cleaner
-    lock = max(2, strip // 6)
+    # Exact locked seam
     back[:, :lock, :] = right[:, -lock:, :]
     back[:, -lock:, :] = left[:, :lock, :]
     back[:lock, :, :] = top[-lock:, :, :]
@@ -455,9 +477,14 @@ def main() -> None:
         right=right,
         top=top,
         bottom=bottom,
-        strip_ratio=0.12,
-        fade_multiplier=1.55,
-        guide_blur_radius=0.35
+        lock_ratio=0.008,
+        source_ratio=0.30,
+        feather_ratio=0.22,
+        source_blur_radius=0.8,
+        guide_blur_radius=0.18,
+        guide_mix_center=0.92,
+        guide_mix_edge=0.18,
+        seam_blur_radius=0.55
     )
 
     if args.debug_back_preview:
