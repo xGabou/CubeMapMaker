@@ -305,25 +305,22 @@ def smoothstep01(x: np.ndarray) -> np.ndarray:
 
 
 def synthesize_back_face(
-    front: np.ndarray,
-    left: np.ndarray,
-    right: np.ndarray,
-    top: np.ndarray,
-    bottom: np.ndarray,
-    lock_ratio: float = 0.008,
-    source_ratio: float = 0.30,
-    feather_ratio: float = 0.22,
-    source_blur_radius: float = 0.8,
-    guide_blur_radius: float = 0.18,
-    guide_mix_center: float = 0.92,
-    guide_mix_edge: float = 0.18,
-    seam_blur_radius: float = 0.55
+    front, left, right, top, bottom,
+    lock_ratio=0.008,
+    source_ratio=0.35,
+    feather_ratio=0.32,
+    source_blur_radius=1.2,
+    guide_blur_radius=0.18,
+    guide_mix_center=0.92,
+    guide_mix_edge=0.18,
+    seam_blur_radius=1.2
 ) -> np.ndarray:
     size = front.shape[0]
 
     lock = max(2, int(size * lock_ratio))
     source_w = max(lock + 16, int(size * source_ratio))
     feather = max(lock + 12, int(size * feather_ratio))
+    corner_r = feather * 1.4  # now safe — feather is defined
 
     rotated_front = np.rot90(front, 2).copy()
     neighbor_avg = (left + right + top + bottom) * 0.25
@@ -332,7 +329,6 @@ def synthesize_back_face(
     if guide_blur_radius > 0.0:
         guide = blur_image(guide, guide_blur_radius)
 
-    # Wide crops, not thin strips
     left_src = right[:, -source_w:, :].copy()
     right_src = left[:, :source_w, :].copy()
     top_src = top[-source_w:, :, :].copy()
@@ -344,7 +340,6 @@ def synthesize_back_face(
         top_src = blur_image(top_src, source_blur_radius)
         bottom_src = blur_image(bottom_src, source_blur_radius)
 
-    # Compress wide crops into seam bands
     left_band = resize_image(left_src, feather, size)
     right_band = resize_image(right_src, feather, size)
     top_band = resize_image(top_src, size, feather)
@@ -381,31 +376,52 @@ def synthesize_back_face(
 
     acc += left_canvas * w_left[..., None]
     wsum += w_left
-
     acc += right_canvas * w_right[..., None]
     wsum += w_right
-
     acc += top_canvas * w_top[..., None]
     wsum += w_top
-
     acc += bottom_canvas * w_bottom[..., None]
     wsum += w_bottom
+
+    # Corner blending
+    d_tl = np.sqrt(xx**2 + yy**2)
+    d_tr = np.sqrt((size - 1 - xx)**2 + yy**2)
+    d_bl = np.sqrt(xx**2 + (size - 1 - yy)**2)
+    d_br = np.sqrt((size - 1 - xx)**2 + (size - 1 - yy)**2)
+
+    w_corner_tl = 1.0 - smoothstep01(d_tl / corner_r)
+    w_corner_tr = 1.0 - smoothstep01(d_tr / corner_r)
+    w_corner_bl = 1.0 - smoothstep01(d_bl / corner_r)
+    w_corner_br = 1.0 - smoothstep01(d_br / corner_r)
+
+    corner_tl = (left_canvas * w_left[..., None] + top_canvas * w_top[..., None]) * 0.5
+    corner_tr = (right_canvas * w_right[..., None] + top_canvas * w_top[..., None]) * 0.5
+    corner_bl = (left_canvas * w_left[..., None] + bottom_canvas * w_bottom[..., None]) * 0.5
+    corner_br = (right_canvas * w_right[..., None] + bottom_canvas * w_bottom[..., None]) * 0.5
+
+    acc += corner_tl * w_corner_tl[..., None]
+    acc += corner_tr * w_corner_tr[..., None]
+    acc += corner_bl * w_corner_bl[..., None]
+    acc += corner_br * w_corner_br[..., None]
+
+    wsum += w_corner_tl + w_corner_tr + w_corner_bl + w_corner_br
 
     back = acc / np.maximum(wsum[..., None], 1e-6)
 
     if seam_blur_radius > 0.0:
         blurred = blur_image(back, seam_blur_radius)
-        seam_mask = np.maximum.reduce([w_left, w_right, w_top, w_bottom])
+        seam_mask = np.maximum.reduce([w_left, w_right, w_top, w_bottom,
+        w_corner_tl, w_corner_tr, w_corner_bl, w_corner_br])
         seam_mask = smoothstep01(seam_mask)[..., None]
         back = back * (1.0 - seam_mask) + blurred * seam_mask
 
-    # Exact locked seam
     back[:, :lock, :] = right[:, -lock:, :]
     back[:, -lock:, :] = left[:, :lock, :]
     back[:lock, :, :] = top[-lock:, :, :]
     back[-lock:, :, :] = bottom[:lock, :, :]
 
     return np.clip(back, 0.0, 1.0)
+
 
 
 def save_debug_back_preview(
@@ -472,20 +488,19 @@ def main() -> None:
     bottom = render_face(source_square, radial_profile, "BOTTOM", args.face_size, args.yaw, args.pitch, args.roll, args.radial_power, not args.no_face_shading)
     
     back = synthesize_back_face(
-        front=front,
-        left=left,
-        right=right,
-        top=top,
-        bottom=bottom,
+        front=front, left=left, right=right, top=top, bottom=bottom,
         lock_ratio=0.008,
-        source_ratio=0.30,
-        feather_ratio=0.22,
-        source_blur_radius=0.8,
-        guide_blur_radius=0.18,
-        guide_mix_center=0.92,
-        guide_mix_edge=0.18,
-        seam_blur_radius=0.55
+        source_ratio=0.35,
+        feather_ratio=0.24,      # tighter blend zone
+        source_blur_radius=0.2,  # nearly no blur on sources
+        guide_blur_radius=0.10,
+        guide_mix_center=0.88,
+        guide_mix_edge=0.20,
+        seam_blur_radius=0.3     # minimal — just softens hard pixel edges
     )
+
+
+
 
     if args.debug_back_preview:
         save_debug_back_preview(args.debug_back_preview, back, left, right, top, bottom)
