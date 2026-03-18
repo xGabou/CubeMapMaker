@@ -396,7 +396,7 @@ def synthesize_back_face(
     back[-lock:, :, :] = bottom[:lock, :, :]
 
         # Final post-process: blend real neighbor pixels into the back face borders
-    back = blend_back_borders(back, left, right, top, bottom, blend_width=80)
+    back = blend_back_borders(back, left, right, top, bottom, blend_width=160, neighbor_blur=0.5)
 
     return np.clip(back, 0.0, 1.0)
 
@@ -440,42 +440,47 @@ def blend_back_borders(
     right: np.ndarray,
     top: np.ndarray,
     bottom: np.ndarray,
-    blend_width: int = 80        # how many pixels deep the blend goes
+    blend_width: int = 160,
+    neighbor_blur: float = 6.0
 ) -> np.ndarray:
     out = back.copy()
     size = back.shape[0]
 
-    # Build a 1D gradient: 1.0 at the very edge, 0.0 at blend_width depth
-    # Using smoothstep so the falloff is perceptually smooth
     t = np.linspace(1.0, 0.0, blend_width, dtype=np.float32)
-    t = t * t * (3.0 - 2.0 * t)  # smoothstep
+    t = t * t * (3.0 - 2.0 * t)
 
-    # LEFT border of back face → sample from right face's right edge column strip
-    for i in range(blend_width):
-        alpha = t[i]
-        # grab column i of the neighbor (their rightmost strip maps to back's left)
-        neighbor_col = right[:, -(blend_width - i), :]
-        out[:, i, :] = out[:, i, :] * (1.0 - alpha) + neighbor_col * alpha
+    right_b  = blur_image(right,  neighbor_blur)
+    left_b   = blur_image(left,   neighbor_blur)
+    top_b    = blur_image(top,    neighbor_blur)
+    bottom_b = blur_image(bottom, neighbor_blur)
 
-    # RIGHT border of back face → sample from left face's left edge column strip
+    # LEFT border of back ← right face rightmost columns
+    right_strip = right_b[:, -blend_width:, :]
     for i in range(blend_width):
-        alpha = t[i]
-        neighbor_col = left[:, blend_width - i - 1, :]
-        out[:, size - 1 - i, :] = out[:, size - 1 - i, :] * (1.0 - alpha) + neighbor_col * alpha
+        a = t[i]
+        out[:, i, :] = out[:, i, :] * (1.0 - a) + right_strip[:, blend_width - 1 - i, :] * a
 
-    # TOP border of back face → sample from top face's bottom row strip
+    # RIGHT border of back ← left face leftmost columns
+    left_strip = left_b[:, :blend_width, :]
     for i in range(blend_width):
-        alpha = t[i]
-        neighbor_row = top[-(blend_width - i), :, :]
-        out[i, :, :] = out[i, :, :] * (1.0 - alpha) + neighbor_row * alpha
+        a = t[i]
+        out[:, size - 1 - i, :] = out[:, size - 1 - i, :] * (1.0 - a) + left_strip[:, blend_width - 1 - i, :] * a
 
-    # BOTTOM border of back face → sample from bottom face's top row strip
+    # TOP border of back ← top face bottom rows, flipped horizontally
+    top_strip = top_b[-blend_width:, ::-1, :]
     for i in range(blend_width):
-        alpha = t[i]
-        neighbor_row = bottom[blend_width - i - 1, :, :]
-        out[size - 1 - i, :, :] = out[size - 1 - i, :, :] * (1.0 - alpha) + neighbor_row * alpha
+        a = t[i]
+        out[i, :, :] = out[i, :, :] * (1.0 - a) + top_strip[blend_width - 1 - i, :, :] * a
+
+    # BOTTOM border of back ← bottom face top rows, flipped horizontally
+    bottom_strip = bottom_b[:blend_width, ::-1, :]
+    for i in range(blend_width):
+        a = t[i]
+        out[size - 1 - i, :, :] = out[size - 1 - i, :, :] * (1.0 - a) + bottom_strip[blend_width - 1 - i, :, :] * a
 
     return np.clip(out, 0.0, 1.0)
+
+
 
 
 
