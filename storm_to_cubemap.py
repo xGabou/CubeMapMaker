@@ -308,120 +308,97 @@ def synthesize_back_face(
     front, left, right, top, bottom,
     lock_ratio=0.008,
     source_ratio=0.35,
-    feather_ratio=0.32,
-    source_blur_radius=1.2,
-    guide_blur_radius=0.18,
-    guide_mix_center=0.92,
-    guide_mix_edge=0.18,
-    seam_blur_radius=1.2
+    feather_ratio=0.24,
+    source_blur_radius=0.2,
+    seam_blur_radius=0.3,
 ) -> np.ndarray:
     size = front.shape[0]
-
     lock = max(2, int(size * lock_ratio))
     source_w = max(lock + 16, int(size * source_ratio))
     feather = max(lock + 12, int(size * feather_ratio))
-    corner_r = feather * 1.4  # now safe — feather is defined
-
-    rotated_front = np.rot90(front, 2).copy()
-    neighbor_avg = (left + right + top + bottom) * 0.25
-    guide = rotated_front * guide_mix_center + neighbor_avg * (1.0 - guide_mix_center)
-
-    if guide_blur_radius > 0.0:
-        guide = blur_image(guide, guide_blur_radius)
-
-    left_src = right[:, -source_w:, :].copy()
-    right_src = left[:, :source_w, :].copy()
-    top_src = top[-source_w:, :, :].copy()
-    bottom_src = bottom[:source_w, :, :].copy()
-
-    if source_blur_radius > 0.0:
-        left_src = blur_image(left_src, source_blur_radius)
-        right_src = blur_image(right_src, source_blur_radius)
-        top_src = blur_image(top_src, source_blur_radius)
-        bottom_src = blur_image(bottom_src, source_blur_radius)
-
-    left_band = resize_image(left_src, feather, size)
-    right_band = resize_image(right_src, feather, size)
-    top_band = resize_image(top_src, size, feather)
-    bottom_band = resize_image(bottom_src, size, feather)
+    corner_r = feather * 1.4
 
     yy, xx = np.mgrid[0:size, 0:size].astype(np.float32)
 
-    d_left = xx
-    d_right = (size - 1) - xx
-    d_top = yy
-    d_bottom = (size - 1) - yy
+    left_src  = blur_image(right[:, -source_w:, :].copy(), source_blur_radius)
+    right_src = blur_image(left[:, :source_w, :].copy(),   source_blur_radius)
+    top_src   = blur_image(top[-source_w:, :, :].copy(),   source_blur_radius)
+    bot_src   = blur_image(bottom[:source_w, :, :].copy(), source_blur_radius)
 
-    w_left = 1.0 - smoothstep01(d_left / feather)
-    w_right = 1.0 - smoothstep01(d_right / feather)
-    w_top = 1.0 - smoothstep01(d_top / feather)
-    w_bottom = 1.0 - smoothstep01(d_bottom / feather)
+    left_band   = resize_image(left_src,  feather, size)
+    right_band  = resize_image(right_src, feather, size)
+    top_band    = resize_image(top_src,   size, feather)
+    bottom_band = resize_image(bot_src,   size, feather)
 
-    edge_strength = np.maximum.reduce([w_left, w_right, w_top, w_bottom])
-    guide_weight = guide_mix_edge + (guide_mix_center - guide_mix_edge) * (1.0 - edge_strength)
-    guide_weight = np.clip(guide_weight, 0.0, 1.0)
+    w_left   = 1.0 - smoothstep01(xx / feather)
+    w_right  = 1.0 - smoothstep01(((size - 1) - xx) / feather)
+    w_top    = 1.0 - smoothstep01(yy / feather)
+    w_bottom = 1.0 - smoothstep01(((size - 1) - yy) / feather)
 
-    acc = guide * guide_weight[..., None]
-    wsum = guide_weight.copy()
+    w_corner_tl = 1.0 - smoothstep01(np.sqrt(xx**2 + yy**2) / corner_r)
+    w_corner_tr = 1.0 - smoothstep01(np.sqrt((size-1-xx)**2 + yy**2) / corner_r)
+    w_corner_bl = 1.0 - smoothstep01(np.sqrt(xx**2 + (size-1-yy)**2) / corner_r)
+    w_corner_br = 1.0 - smoothstep01(np.sqrt((size-1-xx)**2 + (size-1-yy)**2) / corner_r)
 
-    left_canvas = np.zeros_like(guide)
-    right_canvas = np.zeros_like(guide)
-    top_canvas = np.zeros_like(guide)
-    bottom_canvas = np.zeros_like(guide)
+    left_canvas   = np.zeros((size, size, 3), dtype=np.float32)
+    right_canvas  = np.zeros((size, size, 3), dtype=np.float32)
+    top_canvas    = np.zeros((size, size, 3), dtype=np.float32)
+    bottom_canvas = np.zeros((size, size, 3), dtype=np.float32)
 
-    left_canvas[:, :feather, :] = left_band
-    right_canvas[:, -feather:, :] = right_band
-    top_canvas[:feather, :, :] = top_band
+    left_canvas[:, :feather, :]    = left_band
+    right_canvas[:, -feather:, :]  = right_band
+    top_canvas[:feather, :, :]     = top_band
     bottom_canvas[-feather:, :, :] = bottom_band
 
-    acc += left_canvas * w_left[..., None]
-    wsum += w_left
-    acc += right_canvas * w_right[..., None]
-    wsum += w_right
-    acc += top_canvas * w_top[..., None]
-    wsum += w_top
-    acc += bottom_canvas * w_bottom[..., None]
-    wsum += w_bottom
+    acc  = np.zeros((size, size, 3), dtype=np.float32)
+    wsum = np.zeros((size, size),    dtype=np.float32)
 
-    # Corner blending
-    d_tl = np.sqrt(xx**2 + yy**2)
-    d_tr = np.sqrt((size - 1 - xx)**2 + yy**2)
-    d_bl = np.sqrt(xx**2 + (size - 1 - yy)**2)
-    d_br = np.sqrt((size - 1 - xx)**2 + (size - 1 - yy)**2)
+    for canvas, w in [
+        (left_canvas,   w_left),
+        (right_canvas,  w_right),
+        (top_canvas,    w_top),
+        (bottom_canvas, w_bottom),
+    ]:
+        acc  += canvas * w[..., None]
+        wsum += w
 
-    w_corner_tl = 1.0 - smoothstep01(d_tl / corner_r)
-    w_corner_tr = 1.0 - smoothstep01(d_tr / corner_r)
-    w_corner_bl = 1.0 - smoothstep01(d_bl / corner_r)
-    w_corner_br = 1.0 - smoothstep01(d_br / corner_r)
-
-    corner_tl = (left_canvas * w_left[..., None] + top_canvas * w_top[..., None]) * 0.5
-    corner_tr = (right_canvas * w_right[..., None] + top_canvas * w_top[..., None]) * 0.5
-    corner_bl = (left_canvas * w_left[..., None] + bottom_canvas * w_bottom[..., None]) * 0.5
+    corner_tl = (left_canvas  * w_left[..., None]  + top_canvas    * w_top[..., None])    * 0.5
+    corner_tr = (right_canvas * w_right[..., None] + top_canvas    * w_top[..., None])    * 0.5
+    corner_bl = (left_canvas  * w_left[..., None]  + bottom_canvas * w_bottom[..., None]) * 0.5
     corner_br = (right_canvas * w_right[..., None] + bottom_canvas * w_bottom[..., None]) * 0.5
 
-    acc += corner_tl * w_corner_tl[..., None]
-    acc += corner_tr * w_corner_tr[..., None]
-    acc += corner_bl * w_corner_bl[..., None]
-    acc += corner_br * w_corner_br[..., None]
-
+    acc  += corner_tl * w_corner_tl[..., None]
+    acc  += corner_tr * w_corner_tr[..., None]
+    acc  += corner_bl * w_corner_bl[..., None]
+    acc  += corner_br * w_corner_br[..., None]
     wsum += w_corner_tl + w_corner_tr + w_corner_bl + w_corner_br
 
-    back = acc / np.maximum(wsum[..., None], 1e-6)
+    # Edge blend strength (0 = pure interior, 1 = pure edge band)
+    edge_strength = np.clip(wsum, 0.0, 1.0)[..., None]
+    edge_color = acc / np.maximum(wsum[..., None], 1e-6)
+
+    # Interior = rotated front (real texture, no grey)
+    rotated_front = np.rot90(front, 2).copy()
+
+    # Blend: edge bands win at borders, rotated front fills the center
+    back = rotated_front * (1.0 - edge_strength) + edge_color * edge_strength
 
     if seam_blur_radius > 0.0:
+        seam_mask = np.maximum.reduce([w_left, w_right, w_top, w_bottom])[..., None]
+        seam_mask = smoothstep01(seam_mask)
         blurred = blur_image(back, seam_blur_radius)
-        seam_mask = np.maximum.reduce([w_left, w_right, w_top, w_bottom,
-        w_corner_tl, w_corner_tr, w_corner_bl, w_corner_br])
-        seam_mask = smoothstep01(seam_mask)[..., None]
         back = back * (1.0 - seam_mask) + blurred * seam_mask
 
-    back[:, :lock, :] = right[:, -lock:, :]
+    # Pin exact border pixels
+    back[:, :lock, :]  = right[:, -lock:, :]
     back[:, -lock:, :] = left[:, :lock, :]
-    back[:lock, :, :] = top[-lock:, :, :]
+    back[:lock, :, :]  = top[-lock:, :, :]
     back[-lock:, :, :] = bottom[:lock, :, :]
 
-    return np.clip(back, 0.0, 1.0)
+        # Final post-process: blend real neighbor pixels into the back face borders
+    back = blend_back_borders(back, left, right, top, bottom, blend_width=80)
 
+    return np.clip(back, 0.0, 1.0)
 
 
 def save_debug_back_preview(
@@ -457,6 +434,50 @@ def assemble_layout(left, front, right, back, top, bottom) -> np.ndarray:
 
     return canvas
 
+def blend_back_borders(
+    back: np.ndarray,
+    left: np.ndarray,
+    right: np.ndarray,
+    top: np.ndarray,
+    bottom: np.ndarray,
+    blend_width: int = 80        # how many pixels deep the blend goes
+) -> np.ndarray:
+    out = back.copy()
+    size = back.shape[0]
+
+    # Build a 1D gradient: 1.0 at the very edge, 0.0 at blend_width depth
+    # Using smoothstep so the falloff is perceptually smooth
+    t = np.linspace(1.0, 0.0, blend_width, dtype=np.float32)
+    t = t * t * (3.0 - 2.0 * t)  # smoothstep
+
+    # LEFT border of back face → sample from right face's right edge column strip
+    for i in range(blend_width):
+        alpha = t[i]
+        # grab column i of the neighbor (their rightmost strip maps to back's left)
+        neighbor_col = right[:, -(blend_width - i), :]
+        out[:, i, :] = out[:, i, :] * (1.0 - alpha) + neighbor_col * alpha
+
+    # RIGHT border of back face → sample from left face's left edge column strip
+    for i in range(blend_width):
+        alpha = t[i]
+        neighbor_col = left[:, blend_width - i - 1, :]
+        out[:, size - 1 - i, :] = out[:, size - 1 - i, :] * (1.0 - alpha) + neighbor_col * alpha
+
+    # TOP border of back face → sample from top face's bottom row strip
+    for i in range(blend_width):
+        alpha = t[i]
+        neighbor_row = top[-(blend_width - i), :, :]
+        out[i, :, :] = out[i, :, :] * (1.0 - alpha) + neighbor_row * alpha
+
+    # BOTTOM border of back face → sample from bottom face's top row strip
+    for i in range(blend_width):
+        alpha = t[i]
+        neighbor_row = bottom[blend_width - i - 1, :, :]
+        out[size - 1 - i, :, :] = out[size - 1 - i, :, :] * (1.0 - alpha) + neighbor_row * alpha
+
+    return np.clip(out, 0.0, 1.0)
+
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Render a continuous storm cubemap on all faces.")
@@ -488,16 +509,11 @@ def main() -> None:
     bottom = render_face(source_square, radial_profile, "BOTTOM", args.face_size, args.yaw, args.pitch, args.roll, args.radial_power, not args.no_face_shading)
     
     back = synthesize_back_face(
-        front=front, left=left, right=right, top=top, bottom=bottom,
-        lock_ratio=0.008,
-        source_ratio=0.35,
-        feather_ratio=0.24,      # tighter blend zone
-        source_blur_radius=0.2,  # nearly no blur on sources
-        guide_blur_radius=0.10,
-        guide_mix_center=0.88,
-        guide_mix_edge=0.20,
-        seam_blur_radius=0.3     # minimal — just softens hard pixel edges
+        front=front, left=left, right=right, top=top, bottom=bottom
     )
+
+
+
 
 
 
